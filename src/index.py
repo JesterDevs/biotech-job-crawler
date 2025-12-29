@@ -5,7 +5,6 @@ app = FastAPI()
 @app.get("/health")
 def health():
     return {"ok": True}
-/run/test-discover
 from fastapi import FastAPI
 import httpx
 from bs4 import BeautifulSoup
