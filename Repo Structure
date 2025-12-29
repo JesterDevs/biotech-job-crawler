@@ -1,0 +1,16 @@
+biotech-job-crawler/
+  app/
+    __init__.py
+    config.py
+    airtable_client.py
+    compliance.py
+    discover.py
+    extract.py
+    runner.py
+    api.py
+  worker.py
+  requirements.txt
+  Procfile
+  runtime.txt
+  .gitignore
+  README.md
