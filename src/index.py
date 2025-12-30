@@ -277,4 +277,12 @@ async def test_discover():
             "jobs_found": len(discovered),
             "records_written_to_job_sources": created,
         }
+@app.get("/debug/env/raw")
+def debug_env_raw():
+    return {
+        "AIRTABLE_PAT": bool(os.getenv("AIRTABLE_PAT")),
+        "AIRTABLE_PAT_TEST": bool(os.getenv("AIRTABLE_PAT_TEST")),
+    }
+
+
 
