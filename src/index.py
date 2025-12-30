@@ -1,3 +1,9 @@
+APP_VERSION = "2025-12-30-v7-airtable-test"
+
+@app.get("/version")
+def version():
+    return {"version": APP_VERSION}
+    
 from fastapi import FastAPI, HTTPException
 import httpx
 from bs4 import BeautifulSoup
