@@ -1,19 +1,17 @@
-from fastapi import FastAPI, HTTPException
+import os
+from datetime import datetime, timezone
+from urllib.parse import urljoin, urlparse
+
 import httpx
 from bs4 import BeautifulSoup
-from datetime import datetime, timezone
-import os
-import re
-from urllib.parse import quote
+from fastapi import FastAPI, HTTPException
 
-APP_VERSION = "0.3.0"
+app = FastAPI(title="Biotech Job Crawler", version="1.0.0")
 
-app = FastAPI(title="Biotech Job Crawler", version=APP_VERSION)
-
-# ----------------------------
-# Env + config
-# ----------------------------
-AIRTABLE_PAT = os.getenv("AIRTABLE_PAT")  # IMPORTANT: this must match Railway variable name
+# -----------------------------
+# Env / Config
+# -----------------------------
+AIRTABLE_PAT = os.getenv("AIRTABLE_PAT") or os.getenv("AIRTABLE_API_TOKEN")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
 
 AIRTABLE_COMPANIES_TABLE = os.getenv("AIRTABLE_COMPANIES_TABLE", "target_company_registry")
@@ -23,244 +21,203 @@ AIRTABLE_OUTREACH_TABLE = os.getenv("AIRTABLE_OUTREACH_TABLE", "bd_outreach_queu
 
 DEBUG_SHOW_AIRTABLE = os.getenv("DEBUG_SHOW_AIRTABLE", "0") == "1"
 
-if not AIRTABLE_BASE_ID or not AIRTABLE_PAT:
-    # Don't crash on import in prod if you want /health to work,
-    # but most people prefer failing fast:
-    raise RuntimeError("Missing AIRTABLE_PAT or AIRTABLE_BASE_ID environment variables")
+if not AIRTABLE_PAT or not AIRTABLE_BASE_ID:
+    raise RuntimeError("Missing AIRTABLE_PAT (or AIRTABLE_API_TOKEN) or AIRTABLE_BASE_ID environment variables")
 
 AIRTABLE_HEADERS = {
     "Authorization": f"Bearer {AIRTABLE_PAT}",
     "Content-Type": "application/json",
 }
 
-def now_iso():
+AIRTABLE_API = "https://api.airtable.com/v0"
+
+
+def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def airtable_url(table_name: str) -> str:
-    # Airtable allows table names with spaces; URL encode safely
-    return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{quote(table_name, safe='')}"
 
-# ----------------------------
-# Helpers
-# ----------------------------
-async def airtable_get_one_company(client: httpx.AsyncClient):
-    """
-    Pull one company row that is Allowed = true (if field exists),
-    otherwise just grab the first row.
-    """
-    url = airtable_url(AIRTABLE_COMPANIES_TABLE)
+async def airtable_request(client: httpx.AsyncClient, method: str, table: str, *, params=None, json=None):
+    """Wrapper that returns JSON or raises helpful FastAPI error."""
+    url = f"{AIRTABLE_API}/{AIRTABLE_BASE_ID}/{table}"
+    r = await client.request(method, url, headers=AIRTABLE_HEADERS, params=params, json=json)
 
-    # Try to filter to Allowed=1, but if your base doesn't have it, we still succeed.
-    params = {
-        "maxRecords": 1
-    }
-
-    r = await client.get(url, headers=AIRTABLE_HEADERS, params=params)
-    if r.status_code == 401:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "Airtable auth failed (401)",
-                "hint": "Check AIRTABLE_PAT is correct AND token has access to this base",
-                "base_id": AIRTABLE_BASE_ID,
-                "table": AIRTABLE_COMPANIES_TABLE,
-                "debug": {"pat_present": bool(AIRTABLE_PAT)}
-            }
-        )
     if r.status_code >= 400:
-        raise HTTPException(
-            status_code=500,
-            detail={"error": "Airtable read failed", "status": r.status_code, "body": r.text}
-        )
+        detail = {
+            "error": "Airtable request failed",
+            "status": r.status_code,
+            "base_id": AIRTABLE_BASE_ID,
+            "table": table,
+            "body": r.text[:2000],
+        }
+        raise HTTPException(status_code=500, detail=detail)
 
-    data = r.json()
-    records = data.get("records", [])
-    if not records:
-        raise HTTPException(status_code=400, detail={"error": "No company records found in Airtable"})
+    return r.json()
 
-    return records[0]  # full Airtable record (id + fields)
 
-def extract_company_fields(airtable_record: dict):
-    """
-    Accepts your actual Airtable field names.
-    - company_id: use explicit field if present; otherwise use Airtable record id (recXXXX)
-    - careers_url: try common variants
-    """
-    fields = airtable_record.get("fields", {})
-    record_id = airtable_record.get("id")
+def normalize_job_link(careers_url: str, href: str) -> str:
+    return urljoin(careers_url, href)
 
-    # company_id: if you have a field named company_id, use it; else use record_id.
-    company_id = fields.get("company_id") or record_id
 
-    # careers_url: match your screenshot "Careers_URL"
-    careers_url = (
-        fields.get("careers_url")
-        or fields.get("Careers_URL")
-        or fields.get("Careers URL")
-        or fields.get("CareersUrl")
-        or fields.get("careersUrl")
-    )
+def same_domain(a: str, b: str) -> bool:
+    try:
+        return urlparse(a).netloc.lower() == urlparse(b).netloc.lower()
+    except Exception:
+        return False
 
-    company_name = fields.get("Company Name") or fields.get("company_name") or fields.get("Name") or fields.get("name")
 
-    return {
-        "company_id": company_id,
-        "company_name": company_name,
-        "careers_url": careers_url,
-        "fields_present": list(fields.keys())
-    }
-
-def absolutize(href: str, base_url: str) -> str:
-    if href.startswith("http://") or href.startswith("https://"):
-        return href
-    if href.startswith("//"):
-        return "https:" + href
-    if href.startswith("/"):
-        return base_url.rstrip("/") + href
-    return base_url.rstrip("/") + "/" + href.lstrip("/")
-
-def looks_like_job_link(url: str) -> bool:
-    u = url.lower()
-    # simple heuristic for test discover
-    patterns = [
-        r"/job", r"/jobs", r"jobid", r"requisition", r"career", r"opening", r"position"
-    ]
-    return any(re.search(p, u) for p in patterns)
-
-async def airtable_insert_job_sources(client: httpx.AsyncClient, records: list[dict]):
-    """
-    Airtable API limit: 10 records per request.
-    """
-    if not records:
-        return {"inserted": 0}
-
-    url = airtable_url(AIRTABLE_JOB_SOURCES_TABLE)
-    inserted = 0
-
-    for i in range(0, len(records), 10):
-        chunk = records[i:i+10]
-        payload = {"records": chunk}
-        r = await client.post(url, headers=AIRTABLE_HEADERS, json=payload)
-
-        if r.status_code == 401:
-            raise HTTPException(
-                status_code=500,
-                detail={"error": "Airtable write failed (401)", "table": AIRTABLE_JOB_SOURCES_TABLE}
-            )
-        if r.status_code >= 400:
-            raise HTTPException(
-                status_code=500,
-                detail={"error": "Airtable write failed", "status": r.status_code, "body": r.text}
-            )
-
-        inserted += len(chunk)
-
-    return {"inserted": inserted}
-
-# ----------------------------
+# -----------------------------
 # Routes
-# ----------------------------
+# -----------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
 
-@app.get("/version")
-def version():
-    return {"version": APP_VERSION}
 
 @app.get("/run/airtable-test")
 async def airtable_test():
     """
-    Proves:
-    - Railway env vars are loaded
-    - Airtable PAT can read from target_company_registry
+    Confirms we can read the companies table and shows what fields Airtable returns.
     """
-    async with httpx.AsyncClient(timeout=30) as client:
-        rec = await airtable_get_one_company(client)
-        parsed = extract_company_fields(rec)
+    async with httpx.AsyncClient(timeout=25) as client:
+        data = await airtable_request(
+            client,
+            "GET",
+            AIRTABLE_COMPANIES_TABLE,
+            params={"maxRecords": 1},
+        )
 
-        # show minimal debug, never show PAT
-        resp = {
+        records = data.get("records", [])
+        if not records:
+            return {
+                "ok": True,
+                "note": "Companies table is reachable but has 0 records.",
+                "base_id": AIRTABLE_BASE_ID,
+                "companies_table": AIRTABLE_COMPANIES_TABLE,
+            }
+
+        rec = records[0]
+        fields = rec.get("fields", {})
+
+        return {
             "ok": True,
             "base_id": AIRTABLE_BASE_ID,
             "companies_table": AIRTABLE_COMPANIES_TABLE,
             "sample_company": {
                 "airtable_record_id": rec.get("id"),
-                "company_id": parsed["company_id"],
-                "company_name": parsed["company_name"],
-                "careers_url_present": bool(parsed["careers_url"]),
-            }
+                "company_name": fields.get("Company Name"),
+                "careers_url_present": bool(fields.get("Careers_URL") or fields.get("Careers URL") or fields.get("careers_url")),
+            },
+            "debug": {"fields_present": sorted(list(fields.keys()))} if DEBUG_SHOW_AIRTABLE else {"fields_present_count": len(fields)},
         }
-        if DEBUG_SHOW_AIRTABLE:
-            resp["debug"] = {"fields_present": parsed["fields_present"]}
-        return resp
+
 
 @app.post("/run/test-discover")
 async def test_discover():
     """
-    Stage A (Discover) - simple HTML parsing test:
-    - Read 1 company from Airtable
-    - Fetch Careers_URL
-    - Discover job-ish links
-    - Write to job_sources table
+    Stage A (Discover): picks 1 company, fetches Careers_URL, finds job-ish links,
+    writes them into job_sources.
     """
-    async with httpx.AsyncClient(timeout=40, follow_redirects=True) as client:
-        # 1) Get ONE test company record
-        rec = await airtable_get_one_company(client)
-        parsed = extract_company_fields(rec)
+    async with httpx.AsyncClient(timeout=35, follow_redirects=True) as client:
+        # 1) Get one company record
+        data = await airtable_request(
+            client,
+            "GET",
+            AIRTABLE_COMPANIES_TABLE,
+            params={"maxRecords": 1},
+        )
 
-        if not parsed["careers_url"]:
+        records = data.get("records", [])
+        if not records:
+            raise HTTPException(status_code=400, detail="No companies found in target_company_registry")
+
+        rec = records[0]
+        fields = rec.get("fields", {})
+
+        # Your table uses Airtable record id as company_id (good enough)
+        company_id = rec.get("id")
+
+        careers_url = (
+            fields.get("Careers_URL")
+            or fields.get("Careers URL")
+            or fields.get("careers_url")
+        )
+
+        if not careers_url:
             raise HTTPException(
                 status_code=400,
                 detail={
-                    "error": "Company record missing required fields",
-                    "required": ["Careers_URL (or careers_url)"],
-                    "found_fields": parsed["fields_present"]
-                }
+                    "error": "Company record missing required Careers_URL",
+                    "company_record_id": company_id,
+                    "found_fields": sorted(list(fields.keys())),
+                },
             )
 
-        company_id = parsed["company_id"]
-        careers_url = parsed["careers_url"]
-
         # 2) Fetch careers page
-        page = await client.get(careers_url, headers={"User-Agent": "biotech-job-crawler/0.3 (+contact: you@example.com)"})
+        page = await client.get(careers_url, headers={"User-Agent": "biotech-job-crawler/1.0 (+contact: your-email)"})
         if page.status_code >= 400:
             raise HTTPException(
-                status_code=400,
-                detail={"error": "Failed to fetch careers_url", "status": page.status_code, "url": careers_url}
+                status_code=500,
+                detail={"error": "Careers page fetch failed", "status": page.status_code, "careers_url": careers_url},
             )
 
         soup = BeautifulSoup(page.text, "html.parser")
 
-        # 3) Extract job links
+        # 3) Extract job-ish links
         links = set()
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
-            full = absolutize(href, careers_url)
-            if looks_like_job_link(full):
-                links.add(full)
+            if not href:
+                continue
 
-        # 4) Write job links to Airtable job_sources
-        discovered_records = []
-        for link in sorted(links):
-            discovered_records.append({
-                "fields": {
-                    "company_id": company_id,
-                    "job_url": link,
-                    "source_type": "html",
-                    "first_seen_at": now_iso(),
-                    "last_seen_At": now_iso(),  # matches your screenshot's "last_seen_At" casing
-                    "Active": True              # matches your screenshot's "Active" field label
+            # Heuristic: links containing job/career/opening/position
+            low = href.lower()
+            if any(k in low for k in ["job", "career", "opening", "position", "requisition", "req"]):
+                full = normalize_job_link(careers_url, href)
+
+                # Optional: keep only same domain as careers site
+                if same_domain(full, careers_url):
+                    links.add(full)
+                else:
+                    # Still keep it if it's clearly an ATS domain (you can expand this list)
+                    if any(x in urlparse(full).netloc.lower() for x in ["workday", "myworkdayjobs", "jobvite", "icims", "greenhouse", "lever", "adp"]):
+                        links.add(full)
+
+        links = sorted(list(links))
+
+        # 4) Write to job_sources (batch 10 at a time)
+        created = 0
+        now = utc_now_iso()
+
+        if links:
+            chunks = [links[i:i+10] for i in range(0, len(links), 10)]
+            for chunk in chunks:
+                payload = {
+                    "records": [
+                        {
+                            "fields": {
+                                "company_id": company_id,
+                                "job_url": link,
+                                "source_type": "html",
+                                "first_seen_at": now,
+                                "last_seen_At": now,
+                                "Active": True,
+                            }
+                        }
+                        for link in chunk
+                    ]
                 }
-            })
 
-        write_result = await airtable_insert_job_sources(client, discovered_records)
+                # This is where your 403 happens if AIRTABLE_JOB_SOURCES_TABLE is wrong
+                await airtable_request(client, "POST", AIRTABLE_JOB_SOURCES_TABLE, json=payload)
+                created += len(chunk)
 
         return {
-            "company_id": company_id,
+            "company_record_id": company_id,
             "careers_url": careers_url,
-            "jobs_found": len(discovered_records),
-            "airtable_insert": write_result
+            "links_found": len(links),
+            "job_sources_created": created,
+            "sample_links": links[:10],
+            "job_sources_table": AIRTABLE_JOB_SOURCES_TABLE,
         }
 
 
