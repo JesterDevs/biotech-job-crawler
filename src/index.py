@@ -225,4 +225,3 @@ async def test_discover():
             "jobs_found": len(records),
             "written": len(write_result.get("records", [])),
         }
-
